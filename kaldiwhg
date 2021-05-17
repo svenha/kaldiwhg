@@ -1,0 +1,72 @@
+#!/bin/bash
+# see http://kaldi-asr.org/doc/online_decoding.html
+
+set -e -u
+
+arch=$( uname -m )
+if [ "$arch" == "aarch64" ] ; then # ARM
+  MDIR=$HOME/local/asr/models/de 
+else
+  MDIR=/asr/models/de
+fi
+
+if [ $# -eq 0 ] ; then
+  echo "USAGE:"
+  echo "kaldiwhg [-l <out-dir-for-log-and-debug-files>] [-o <out-dir-for-parser-graph>] <wav-file-16k-mono> ..."
+  echo "  Default for directories is $MDIR"
+  echo "EXAMPLES:"
+  echo "  kaldiwhg asrde.wav"
+  echo "  kaldiwhg -l log -o whg 16k/3001-001.wav"
+  echo "  kaldiwhg -l log -o whg 16k/*-001.wav"
+  exit 0
+fi
+if [ "$1" == "-l" ] ; then
+  logdir=$( readlink -f $2 )
+  shift 2
+else
+  logdir=$MDIR
+fi
+
+if [ "$1" == "-o" ] ; then
+  outdir=$( readlink -f $2 )
+  shift 2
+else
+  outdir=$MDIR
+fi
+
+oldpwd=$PWD
+for infile in $* ; do
+  base=$( basename $infile )
+  inpath=$( readlink -f $infile )
+  graphfile=${base%.wav}.graph
+  graphpath="$outdir/$graphfile"
+  logfile=${base%.wav}.log
+  logpath="$logdir/$logfile"
+  dbgfile=${base%.wav}.dbg
+  dbgpath="$logdir/$dbgfile"
+  echo "$inpath -> $graphpath $logpath $dbgpath"
+  cd $MDIR
+  ln -sf $inpath my_de.wav # link OR copy:
+  #cp $inpath my_de.wav
+# candidates for --mfcc-config : conf/mfcc_hires.conf conf/mfcc.conf
+# --ivector-extraction-config=ivectors_test_hires/conf/ivector_extractor.conf
+
+#online2-wav-nnet3-latgen-faster --verbose=1 --ivector-extraction-config=ivectors_test_hires/conf/ivector_extractor.conf --mfcc-config=conf/mfcc_hires.conf --do-endpointing=false --online=false --max-active=7000 --beam=15.0 --lattice-beam=6.0 --acoustic-scale=0.1 --word-symbol-table=model/graph/words.txt model/final.mdl model/graph/HCLG.fst 'ark:echo utterance-id1 utterance-id1|' 'scp:echo utterance-id1 my_de.wav|' ark:/dev/null # original parameters
+#time online2-wav-nnet3-latgen-faster --ivector-extraction-config=ivectors_test_hires/conf/ivector_extractor.conf --mfcc-config=conf/mfcc_hires.conf --do-endpointing=false --online=false --max-active=1000 --beam=9.0  --lattice-beam=4.0 --acoustic-scale=0.5 --word-symbol-table=model/graph/words.txt model/final.mdl model/graph/HCLG.fst 'ark:echo utterance-id1 utterance-id1|' 'scp:echo utterance-id1 my_de.wav|' ark:my_de.lats # fewer alternatives
+#time online2-wav-nnet3-latgen-faster --ivector-extraction-config=ivectors_test_hires/conf/ivector_extractor.conf --mfcc-config=conf/mfcc_hires.conf --do-endpointing=false --online=false --max-active=3000 --beam=10.0 --lattice-beam=5.0 --acoustic-scale=0.5 --word-symbol-table=model/graph/words.txt model/final.mdl model/graph/HCLG.fst 'ark:echo utterance-id1 utterance-id1|' 'scp:echo utterance-id1 my_de.wav|' ark:my_de.lats # middle tests, needed for 3022
+#time online2-wav-nnet3-latgen-faster --ivector-extraction-config=ivectors_test_hires/conf/ivector_extractor.conf --mfcc-config=conf/mfcc_hires.conf --do-endpointing=false --online=false --max-active=3000 --beam=11.0 --lattice-beam=6.0 --acoustic-scale=0.3 --word-symbol-table=model/graph/words.txt model/final.mdl model/graph/HCLG.fst 'ark:echo utterance-id1 utterance-id1|' 'scp:echo utterance-id1 my_de.wav|' ark:my_de.lats # more alternatives
+  online2-wav-nnet3-latgen-faster --ivector-extraction-config=ivectors_test_hires/conf/ivector_extractor.conf --mfcc-config=conf/mfcc_hires.conf --do-endpointing=false --online=false --max-active=3000 --beam=11.0 --lattice-beam=6.0 --acoustic-scale=0.3 --word-symbol-table=model/graph/words.txt model/final.mdl model/graph/HCLG.fst 'ark:echo utterance-id1 utterance-id1|' 'scp:echo utterance-id1 my_de.wav|' ark:my_de.lats >& /dev/null # more alternatives
+# beam 15 , lattice-beam 6, max-active=7000 too wide (too many alternatives)
+# acoustic-scale: 0.3 too high (no alternatives for 3058), 0.5 needed for 3018
+
+  lattice-align-words-lexicon --partial-word-label=4324 --max-expand=10.0 --test=true model/graph/phones/align_lexicon.int model/final.mdl ark:my_de.lats ark:my_de_aligned.lats >& /dev/null # OR lattice-align-words call below
+#lattice-align-words  --silence-label=4320 --partial-word-label=4324 model/graph/phones/word_boundary.int model/final.mdl ark:my_de.lats ark:my_de_aligned.lats
+  lattice-arc-post --acoustic-scale=0.1  'ark:my_de_aligned.lats' post.txt >& /dev/null # --print-alignment=true adds unneeded information ;  model/final.mdl as argument will add phone sequence at the end of each line
+# 5th column is the word id (0-based, add 1 to get the line number in model/graph/phones/align_lexicon.txt)
+
+ #kaldiwhg.bin -d -lex model/graph/phones/align_lexicon.txt -log $logpath -graph $graphpath -a 3 -i 6 -msp 0.02 -t 0.004 post.txt > $dbgpath # bigloo binary
+  kaldiwhg.scm    -lex model/graph/phones/align_lexicon.txt -log $logpath -graph $graphpath -a 3 -i 6 -msp 0.02 -t 0.004 post.txt > $dbgpath # Guile script
+  rm my_de.lats my_de_aligned.lats
+ #n2.update -o -cd ~/nli -l accept-false-lower-case -n dvi -parse-graph $graphpath # internal: use parser
+  cd $oldpwd
+done
