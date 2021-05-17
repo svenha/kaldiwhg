@@ -411,7 +411,7 @@
         ;(debug 3 "asr->graph-main: arg: " arg)
         (cond ((not arg) ; end of args
                (when (= num-runs 0)
-                 (wr/n "USAGE: kaldiwhg [-a max-alt] [-d] [-graph graph-file] [-i max-iter] [-lex lexicon-file] [-log log-file] [-msp <min-score-percentage] [-t threshold-for-probability] posterior-file-from-asr")
+                 (wr/n "USAGE: " (car args0) " [-a max-alt] [-d] [-graph graph-file] [-i max-iter] [-lex lexicon-file] [-log log-file] [-msp <min-score-percentage] [-t threshold-for-probability] posterior-file-from-asr")
                  (wr/n "  graph-file:    " graph-file)
                  (wr/n "  lexicon-file:  " lex-file)
                  (wr/n "  log-file:      " log-file)
