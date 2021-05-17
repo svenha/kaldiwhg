@@ -1,0 +1,457 @@
+
+; TODO remove arcs at the end, that don't end at the final node (dead ends)
+(define *min-score-perc ; alternative must be at least this big compared to the best one
+  0.05
+  ;0.10
+  )
+
+(define (asr->graph asr lex thresh max-iter max-alt score-factor score-shift graph-file log-file)
+  ; maybe: prune unlikely candidates
+  (for-each (lambda (w)
+              ;(debug 3 "asr->graph: initial w: " w)
+              (list-modify! w 1 (lambda (num-frames) ; turn num-frames into end-frame
+                                  (+ num-frames (car w))))
+              (list-modify! w 3 (lambda (w-id)
+                                  (vector-ref lex w-id))))
+            asr)
+  ; remove silence:
+  (set! asr (remove! (lambda (w1)
+                       (let ((tok (fourth w1)))
+                         (or (member tok '("!SIL" "nspc"))
+                             (<= (string-length tok) 1))))
+                     asr))
+  (set! asr (asr-score-thresh asr (* thresh 0.5)))
+  (let ((prev-nodes (asr->nodes asr))
+        (extreme-nodes '())
+        (thresh-applied? #f)
+        (ok #t))
+    (let iter ((i 1))
+      (set! asr (asr-sort asr))
+      (when (debugging? 3)
+        (debug 3 "asr->graph: iter " i)
+        (asr-show asr 40))
+      (set! asr (asr-compress asr))
+      (when (= i 3) ; in this one iteration, apply thresh after asr-compress
+        (set! asr (asr-score-thresh asr thresh))
+        (set! thresh-applied? #t))
+      (set! asr (asr-smooth asr i))
+      (let ((nodes (asr->nodes asr))
+            (b-nodes (asr->beg-nodes asr))
+            (e-nodes (asr->end-nodes asr)))
+        (set! extreme-nodes (remp (lambda (node)
+                                    (and (member node b-nodes)
+                                         (member node e-nodes)))
+                                  nodes))
+        (debug 3 "asr->graph: b-nodes: " b-nodes)
+        (debug 3 "asr->graph: e-nodes: " e-nodes)
+        (debug 3 "asr->graph: extreme nodes (only-beg OR only-end): " extreme-nodes)
+        (cond ((and (list-length=? nodes (length prev-nodes))
+                    thresh-applied?
+                    (list-length=? extreme-nodes 2))
+               (debug 3 "asr->graph: fix point reached (number of nodes) in interation " i)
+               #t)
+              (else
+                (set! prev-nodes nodes)
+                (cond ((>= i max-iter)
+                       (wr/n "WARNING: max-iter reached " i)
+                       ;(exit 1)
+                       )
+                      (else
+                        (iter (+ i 1))))))))
+    (set! asr (asr-prune-reflexive-arcs asr -1))
+    (let iter ((i 1))
+      (let ((num-extreme-nodes (length extreme-nodes)))
+        (debug 3 "asr->graph: extreme nodes (only-beg OR only-end): " extreme-nodes)
+        (when (> num-extreme-nodes 2)
+          (let ((problem-nodes (list-sublist extreme-nodes 1 (- num-extreme-nodes 1))))
+            (debug 3 "asr->graph: in iter " i " problem-nodes: " problem-nodes)
+            (cond (#f ; (= i 1) ; first iteration: remove isolated nodes in asr
+                   (set! asr (asr-remove/nodes asr problem-nodes)))
+                  (else
+                    (when (list-length>? problem-nodes 1)
+                      (let ((node1 (car problem-nodes))
+                            (node2 (second problem-nodes)))
+                        (cond ((< (abs (- node1 node2)) (* max-iter 4))
+                               (asr-substitute! asr (list (list node1 node2))))
+                              (else
+                                (wr/n "WARNING: problem-nodes not unified due to large distance " problem-nodes)
+                                (set! ok #f)))))))
+            (when ok
+              (let ((nodes (asr->nodes asr))
+                    (b-nodes (asr->beg-nodes asr))
+                    (e-nodes (asr->end-nodes asr)))
+                (set! extreme-nodes (remp (lambda (node)
+                                            (and (member node b-nodes)
+                                                 (member node e-nodes)))
+                                          nodes))
+                (when (< i 4)
+                  (iter (+ i 1)))))))))
+    ;(asr-normalize-nodes asr)
+    (set! asr (asr-prune-reflexive-arcs asr 0))
+    (when (debugging? 3)
+      (debug 3 "asr->graph: after prune-reflexive-arcs")
+      (asr-show asr 40))
+    (asr-normalize-nodes asr)
+    (when (debugging? 3)
+      (debug 3 "asr->graph: after normalize-nodes")
+      (asr-show asr 40))
+    (set! asr (asr-sort-final asr))
+    (set! asr (asr-prune-alternatives asr max-alt))
+    (when (debugging? 3)
+      (debug 3 "asr->graph: after prune-alternatives")
+      (asr-show asr 40))
+    (set! asr (asr-reconnect asr))
+    (when (debugging? 3)
+      (debug 3 "asr->graph: after reconnect")
+      (asr-show asr 40))
+    (when log-file
+      (with-output-to-file log-file
+                           (lambda ()
+                             (asr-show asr 40))))
+    (let ((graph (asr->parser-graph asr score-factor score-shift)))
+      (when graph-file
+        (with-output-to-file graph-file
+                             (lambda ()
+                               (write graph) (newline))))
+      graph)))
+
+;
+
+(define (asr-reconnect asr)
+  (let* ((beg-node 1)
+         (nodes (asr->nodes/dups asr))
+         (end-node (last nodes))
+         (b-nodes (asr->beg-nodes asr))
+         (e-nodes (asr->end-nodes asr)))
+    (filter
+     (lambda (w1)
+       (let ((n2 (second w1)))
+         (cond ((and (not (= n2 end-node)) ; end of arc has no continuation and is not the final node of the graph (a dead end that needs connecting, can happen throug smoothing before)
+                     (not (member n2 b-nodes)))
+                (let ((n2-new (+ n2 1)))
+                  (cond ((member n2-new b-nodes)
+                         (asr-substitute! asr `((,n2 ,n2-new)))
+                         (set! b-nodes (asr->beg-nodes asr)) ; recalculate
+                         (set! e-nodes (asr->end-nodes asr))
+                         w1)
+                        (else
+                         (module-warning "kaldiwhg" "asr-reconnect: no candidate found" n2)
+                         #f))))
+               (else
+                #t))))
+     asr)))
+
+;
+
+(define (asr-remove/nodes asr nodes)
+  (remove! (lambda (w1)
+             (let ((drop? (or (member (car w1) nodes)
+                              (member (second w1) nodes))))
+               (when (and (debugging? 3)
+                          drop?)
+                 (debug 3 "asr-remove/nodes: dropping arc: " w1))
+               drop?))
+           asr))
+
+(define (asr-score-thresh asr thresh)
+  (remove! (lambda (w1)
+             (let ((drop? (< (third w1) thresh)))
+               (when (and (debugging? 3)
+                          drop?)
+                 (debug 3 "asr-score-thresh: dropping arc: " w1 " thresh: " thresh))
+               drop?))
+           asr))
+
+;
+
+(define (asr->parser-graph asr score-factor score-shift)
+  (let* ((beg-node 1)
+         (nodes (asr->nodes/dups asr))
+         (end-node (last nodes))
+         (arcs (map (lambda (w)
+                      (let* ((score0 (third w))
+                             (token (fourth w))
+                             (score (min 1 (+ score-shift (* score0 score-factor)))))
+                        (list (car w) (second w) token #;(utf8->iso-latin token) score)))
+                    asr))) ; score should be final
+    (cons* beg-node end-node arcs)))
+
+
+;
+
+(define (asr-show asr max-indent)
+  (let ((max-beg (extremum car > asr)))
+    (for-each
+      (lambda (asr)
+        (let ((beg (car asr)))
+          (write-spaces (quotient-fix beg max-beg max-indent))
+          (wr (integer->string-pad beg 6 #\space))
+          (wr (integer->string-pad (second asr) 6 #\space))
+          (wr "   " (float->string (third asr) 4))
+          (wr "   " (fourth asr))
+          (newline)))
+      asr)))
+
+
+; a arc is considered reflexive if length (i.e. end - start) is <= max-frames
+; -1 means a function on the length of the word
+; Note: If length is measured in words, max-frames should be 0.
+
+(define (asr-prune-reflexive-arcs asr max-frames)
+  (remove! (lambda (w1)
+             (let ((rem? (<= (- (second w1) (car w1)) (if (= max-frames -1)
+                                                          (guess-min-frame (fourth w1))
+                                                          max-frames)))) ; = can happen for recognition results with very short frame range ; > : just to be safe
+               (when (and (debugging? 3)
+                          rem?)
+                 (debug 3 "asr-prune-reflexive-arcs: pruning: " w1))
+               rem?))
+           asr))
+
+; 6: too high for 3023-003 ("in")
+
+(define (guess-min-frame token)
+  (let ((n (string-length token)))
+    (if (<= n 2)
+        5
+        (+ 6 (* 2 (- n 3)))))) ; for n=3: 6
+
+; input must be sorted by start-node end-node and score
+
+(define (asr-prune-alternatives asr max-alt)
+  (let ((prev (list 0 0))
+        (best 1)
+        (n 0))
+    (map-if (lambda (w1)
+              (cond ((eq? (list-compare-n number-compare prev w1 2) 'equal)
+                     (set! n (+ n 1))
+                     (and (<= n max-alt)
+                          (>= (/ (third w1) best) ; at least this portion of the best score
+                              *min-score-perc)
+                          w1))
+                    (else ; new block of alternatives (base on start-node and end-node)
+                      (set! n 1)
+                      (set! prev w1)
+                      (set! best (third w1))
+                      w1)))
+            asr)))
+
+
+; combines scores for identical arcs (max, or sum)
+
+(define (asr-compress asr)
+  (list-compress! (lambda (w1 w2) ; same span and same orth
+                    (and (= (car w1) (car w2))
+                         (= (second w1) (second w2))
+                         (string=? (fourth w1) (fourth w2))))
+                  (lambda (w1 w2)
+                    (list-modify! w1 2 (lambda (score1)
+                                         (let ((score2 (third w2)))
+                                           ;(+ score1 score2)
+                                           (max score1 score2))))
+                    w1)
+                  asr))
+
+;
+
+(define (asr->nodes/dups asr)
+  (append-map (lambda (w)
+                (list (car w) (second w)))
+              asr))
+
+;
+
+(define (asr-smooth asr dist)
+  (let* ((positions0 (asr->nodes/dups asr))
+         (positions (list->mset number-compare positions0))
+         (substs '()))
+    ;(debug 3 "asr-smooth: positions: " positions)
+    (for-each-rest (lambda (pos1 rest)
+                     (and-let* ((pos2 (list-ref-check rest 0)))
+                       (let ((beg1 (car pos1))
+                             (beg2 (car pos2)))
+                         (when (<= (abs (- beg1 beg2)) dist)
+                           (let* ((freq1 (second pos1))
+                                  (freq2 (second pos2))
+                                  (subst (if (>= freq1 freq2)
+                                             (list beg2 beg1)
+                                             (list beg1 beg2))))
+                             (set! substs (cons subst substs)))))))
+                   positions)
+    ; apply substitutions:
+    (debug 3 "asr-smooth: substitutions: " substs)
+    (asr-substitute! asr substs)
+    asr))
+
+;
+
+(define (asr-substitute! asr substs)
+  (debug 3 "asr-substitute!: substs: " substs)
+  (for-each (lambda (w)
+              (w-info-substitute-frames w substs)) 
+            asr))
+
+
+;
+
+(define (w-info-substitute-frames w substs)
+  (for-each (lambda (i)
+              (let* ((old-val (list-ref w i))
+                     (new-val (assoc-value substs old-val)))
+                (when new-val
+                  (list-set! w i new-val))))
+            '(0 1))) ; substitute in beg-frame and end-frame
+
+
+; sort for easy combining similar arcs
+
+(define (asr-sort asr)
+  (list-sort (combine-compare4
+               (lambda (w1 w2)
+                 (number-compare (car w1) (car w2)))
+               (lambda (w1 w2)
+                 (number-compare (second w1) (second w2)))
+               (lambda (w1 w2)
+                 (string-compare (fourth w1) (fourth w2)))
+               (lambda (w1 w2) ; then by decreasing score
+                 (number-compare (third w2) (third w1))))
+             asr))
+
+; like asr-sort, but score before token
+
+(define (asr-sort-final asr)
+  (list-sort (combine-compare4
+               (lambda (w1 w2)
+                 (number-compare (car w1) (car w2)))
+               (lambda (w1 w2)
+                 (number-compare (second w1) (second w2)))
+               (lambda (w1 w2)
+                 (number-compare (third w2) (third w1)))
+               (lambda (w1 w2)
+                 (string-compare (fourth w1) (fourth w2))))
+             asr))
+
+
+; result list is sorted numerically
+
+(define (asr->nodes asr)
+  (union-map number-compare
+             (lambda (w)
+               (list (car w) (second w)))
+             asr))
+
+
+; set of begin nodes (represented as a sorted list)
+
+(define (asr->beg-nodes asr)
+  (list-sort-no-duplicates number-compare (map car asr)))
+
+
+; set of end nodes (represented as a sorted list)
+
+(define (asr->end-nodes asr)
+  (list-sort-no-duplicates number-compare (map second asr)))
+
+
+;
+
+(define (asr-normalize-nodes asr)
+  (let* ((nodes0 (asr->nodes asr))
+         (num-nodes (length nodes0))
+         (nodes1 (iota num-nodes 1))
+         (substs (zip nodes0 nodes1)))
+    (debug 3 "asr-normalize-nodes: substs: " substs)
+    (for-each
+      (lambda (w)
+        (w-info-substitute-frames w substs))
+      asr)
+    asr))
+
+
+
+(define (load-lexicon f)
+  (let ((lines (list->vector (call-with-input-file f read-lines-string))))
+    (vector-map!
+      (lambda (line)
+        (string-prefix line (string-char-position line #\space)))
+      lines)
+    lines))
+
+; format: beg-frame end-frame posterior word-id
+
+(define (load-asr f)
+  (let ((lines (call-with-input-file f read-lines-string)))
+    (map!
+      (lambda (line)
+        (let ((parts (string-tokenize1 (cut char=? <> #\tab) line)))
+          (map string->number (cdr parts))))
+      lines)))
+
+;
+
+(define (asr->graph-main args0)
+  (let ((graph-file #f)
+        (lex-file "align_lexicon.txt")
+        (lex #f)
+        (log-file #f)
+        (max-alt 4)
+        (max-iter 20)
+        (score-factor
+          0.1
+          ;0.2
+          )
+        (score-shift
+          0.9
+          ;0.8
+          )
+        (thresh 0.05)
+        (num-runs 0))
+    (let iter ((args (cdr args0)))
+      (let ((arg (list-ref-check args 0)))
+        ;(debug 3 "asr->graph-main: arg: " arg)
+        (cond ((not arg) ; end of args
+               (when (= num-runs 0)
+                 (wr/n "USAGE: kaldiwhg [-a max-alt] [-d] [-graph graph-file] [-i max-iter] [-lex lexicon-file] [-log log-file] [-msp <min-score-percentage] [-t threshold-for-probability] posterior-file-from-asr")
+                 (wr/n "  graph-file:    " graph-file)
+                 (wr/n "  lexicon-file:  " lex-file)
+                 (wr/n "  log-file:      " log-file)
+                 (wr/n "  max-alt:       " max-alt)
+                 (wr/n "  max-iter:      " max-iter)
+                 (wr/n "  min-score-perc:" *min-score-perc)
+                 (wr/n "  prob. thresh.: " thresh)
+                 (wr/n "  score-factor:  " score-factor)
+                 (wr/n "  score-shift:   " score-shift))
+               #t)
+              ((string=? arg "-a")
+               (set! max-alt (string->number (second args)))
+               (iter (cddr args)))
+              ((string=? arg "-d")
+               (debug-on)
+               (debug 1 "debug: on")
+               (iter (cdr args)))
+              ((string=? arg "-graph")
+               (set! graph-file (second args))
+               (iter (cddr args)))
+              ((string=? arg "-i")
+               (set! max-iter (string->number (second args)))
+               (iter (cddr args)))
+              ((string=? arg "-lex")
+               (set! lex-file (second args))
+               (set! lex #f)
+               (iter (cddr args)))
+              ((string=? arg "-log")
+               (set! log-file (second args))
+               (iter (cddr args)))
+              ((string=? arg "-msp")
+               (set! *min-score-perc (string->number (second args)))
+               (iter (cddr args)))
+              ((string=? arg "-t")
+               (set! thresh (string->number (second args)))
+               (iter (cddr args)))
+              (else
+                (unless lex
+                  (set! lex (load-lexicon lex-file)))
+                (let ((asr (load-asr arg)))
+                  (asr->graph asr lex thresh max-iter max-alt score-factor score-shift graph-file log-file))
+                (set! num-runs (+ num-runs 1))
+                (iter (cdr args))))))))

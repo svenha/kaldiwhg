@@ -1,0 +1,18 @@
+#! /usr/bin/guile -s
+!#
+
+(cond-expand (guile
+(use-modules
+  (ice-9 ftw)
+  (ice-9 optargs)
+  (ice-9 popen)
+  (ice-9 rdelim) ; for: read-line
+  (ice-9 time) ; for: current-second
+  (srfi  srfi-1)
+  (srfi  srfi-2)
+  (srfi srfi-11)
+  (srfi srfi-26)
+  (srfi srfi-37)
+  (srfi srfi-38)
+  (srfi srfi-98))
+)(else))

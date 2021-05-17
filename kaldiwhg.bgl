@@ -1,0 +1,8 @@
+(module foo
+(include "bigloo.scm")
+(include "general.scm")
+(include "srfi-1.scm")
+(include "string.scm")
+(include "vector.scm")
+(include "kaldiwhg.pscm")
+(main asr->graph-main))
