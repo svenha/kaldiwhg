@@ -8,7 +8,7 @@ guile (tested with version 2.2 and 3.0 under Ubuntu 20.04 and 20.10) or any othe
 
 ## Installation
 
-To use kaldiwhg as as script, just run `make` and make sure that `kaldiwhg.scm` is in your path.
+To use kaldiwhg as as script, just run `make` and make sure that `kaldiwhg` and `kaldiwhg.scm` are in your path.
 
 ## Usage
 
